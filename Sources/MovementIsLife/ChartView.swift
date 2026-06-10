@@ -11,6 +11,7 @@ struct ChartData {
 }
 
 /// Лента сегодняшнего дня + столбики тренда за 7 дней + строка-мотиватор.
+/// При наведении на сегмент/столбик внизу показывается детальный ридаут.
 /// Встраивается как view в пункт меню — без отдельного окна.
 final class ChartView: NSView {
     var data = ChartData(segments: [], now: 0, sitLimit: 3000, bars: [], breaksToday: 0, longestToday: 0) {
@@ -20,43 +21,78 @@ final class ChartView: NSView {
     override var isFlipped: Bool { false } // координаты снизу вверх
 
     override init(frame frameRect: NSRect) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 196))
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 232))
     }
     required init?(coder: NSCoder) { fatalError() }
 
     private let pad: CGFloat = 16
 
+    // Зоны для hit-test при наведении (заполняются при отрисовке).
+    private var segHit: [(rect: NSRect, seg: Seg)] = []
+    private var barHit: [(rect: NSRect, bar: WeekBar)] = []
+    private var hoverText: String?
+
+    // MARK: - Hover
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self, userInfo: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        var text: String? = nil
+        if let hit = segHit.first(where: { $0.rect.insetBy(dx: -2, dy: -2).contains(p) }) {
+            let s = hit.seg
+            let dur = s.end - s.start
+            text = "\(timeString(s.start))–\(timeString(s.end)) · \(durString(dur))"
+        } else if let hit = barHit.first(where: { $0.rect.insetBy(dx: -3, dy: 0).contains(p) }) {
+            let b = hit.bar
+            text = "\(b.label.capitalized) · \(oneDp(b.hours)) ч" + (b.isToday ? " (сегодня)" : "")
+        }
+        if text != hoverText { hoverText = text; needsDisplay = true }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if hoverText != nil { hoverText = nil; needsDisplay = true }
+    }
+
+    // MARK: - Отрисовка
+
     override func draw(_ dirtyRect: NSRect) {
-        let W = bounds.width, _ = bounds.height
+        segHit.removeAll(); barHit.removeAll()
+        let W = bounds.width
         let left = pad, right = W - pad
         let innerW = right - left
 
-        drawCaption("Сегодня · ритм дня", at: NSPoint(x: left, y: 176))
-        drawStrip(x0: left, x1: right, y: 156, h: 14)
+        drawCaption("Сегодня · ритм дня", at: NSPoint(x: left, y: 208))
+        drawStrip(x0: left, x1: right, y: 186, h: 16)
 
-        drawCaption("За неделю · часов в день", at: NSPoint(x: left, y: 134))
-        drawBars(x0: left, width: innerW, baseline: 80, maxH: 50)
+        drawCaption("За неделю · часов в день", at: NSPoint(x: left, y: 150))
+        drawBars(x0: left, width: innerW, baseline: 66, maxH: 60)
 
-        drawStats(x0: left, width: innerW, y: 18)
+        drawBottom(x0: left, width: innerW, y: 16)
     }
 
     // MARK: - Лента дня
 
     private func drawStrip(x0: CGFloat, x1: CGFloat, y: CGFloat, h: CGFloat) {
         let segs = data.segments
-        let dayStart = (segs.map { $0.start }.min() ?? (data.now - 3600))
+        let dayStart = segs.map { $0.start }.min() ?? (data.now - 3600)
         let dayEnd = max(data.now, segs.map { $0.end }.max() ?? data.now)
         let span = max(dayEnd - dayStart, 1)
         let w = x1 - x0
 
         func xOf(_ t: Double) -> CGFloat { x0 + CGFloat((t - dayStart) / span) * w }
 
-        // Трек (время «вне сидения»).
         let track = NSBezierPath(roundedRect: NSRect(x: x0, y: y, width: w, height: h), xRadius: h/2, yRadius: h/2)
         NSColor.quaternaryLabelColor.setFill()
         track.fill()
 
-        // Сегменты сидения.
         for s in segs {
             let sx = xOf(s.start), ex = xOf(s.end)
             guard ex > sx else { continue }
@@ -64,7 +100,6 @@ final class ChartView: NSView {
             NSColor.controlAccentColor.setFill()
             NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3).fill()
 
-            // Красная зона — часть сидения за порогом «встать».
             let overStart = s.start + data.sitLimit
             if overStart < s.end {
                 let ox = xOf(overStart)
@@ -72,9 +107,9 @@ final class ChartView: NSView {
                 NSColor.systemRed.withAlphaComponent(0.9).setFill()
                 NSBezierPath(roundedRect: orect, xRadius: 3, yRadius: 3).fill()
             }
+            segHit.append((rect, s))
         }
 
-        // Подписи времени по краям.
         drawSmall(timeString(dayStart), at: NSPoint(x: x0, y: y - 15), align: .left)
         drawSmall(timeString(dayEnd),   at: NSPoint(x: x1, y: y - 15), align: .right)
     }
@@ -87,12 +122,12 @@ final class ChartView: NSView {
 
         let nonZero = bars.filter { $0.hours > 0 }.map { $0.hours }
         let avg = nonZero.isEmpty ? 0 : nonZero.reduce(0, +) / Double(nonZero.count)
-        let peak = max(bars.map { $0.hours }.max() ?? 1, avg, 1)
+        // Запас сверху 25 %, чтобы подписи над столбиком не упирались в заголовок.
+        let peak = max(max(bars.map { $0.hours }.max() ?? 1, avg), 0.1) * 1.25
 
         let slot = width / CGFloat(bars.count)
         let bw = slot * 0.56
 
-        // Линия среднего.
         if avg > 0 {
             let ay = baseline + CGFloat(avg / peak) * maxH
             let line = NSBezierPath()
@@ -102,7 +137,7 @@ final class ChartView: NSView {
             line.setLineDash([3, 3], count: 2, phase: 0)
             NSColor.tertiaryLabelColor.setStroke()
             line.stroke()
-            drawSmall("среднее \(oneDp(avg)) ч", at: NSPoint(x: x0, y: ay + 2), align: .left)
+            drawSmall("ср. \(oneDp(avg)) ч", at: NSPoint(x: x0, y: ay + 3), align: .left)
         }
 
         for (i, bar) in bars.enumerated() {
@@ -113,24 +148,28 @@ final class ChartView: NSView {
                 (bar.isToday ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor).setFill()
                 NSBezierPath(roundedRect: rect, xRadius: 2.5, yRadius: 2.5).fill()
             }
-            // День недели.
             drawSmall(bar.label, at: NSPoint(x: cx, y: baseline - 15), align: .center,
                       color: bar.isToday ? .labelColor : .secondaryLabelColor)
-            // Значение над сегодняшним столбиком.
             if bar.isToday && bar.hours > 0 {
-                drawSmall(oneDp(bar.hours), at: NSPoint(x: cx, y: baseline + bh + 1), align: .center,
+                drawSmall(oneDp(bar.hours), at: NSPoint(x: cx, y: baseline + bh + 2), align: .center,
                           color: .labelColor)
             }
+            // Зона наведения — на всю высоту слота, чтобы попасть было легко.
+            barHit.append((NSRect(x: cx - slot/2, y: baseline - 4, width: slot, height: maxH + 8), bar))
         }
     }
 
-    // MARK: - Строка-мотиватор
+    // MARK: - Нижняя строка: при наведении — детали, иначе — мотиватор
 
-    private func drawStats(x0: CGFloat, width: CGFloat, y: CGFloat) {
-        let breaks = data.breaksToday
-        let longest = data.longestToday
-        let text = "Перерывов: \(breaks)   ·   макс. сидение \(durString(longest))"
-        drawSmall(text, at: NSPoint(x: x0 + width/2, y: y), align: .center, color: .secondaryLabelColor, size: 11)
+    private func drawBottom(x0: CGFloat, width: CGFloat, y: CGFloat) {
+        if let hover = hoverText {
+            drawSmall(hover, at: NSPoint(x: x0 + width/2, y: y), align: .center,
+                      color: .controlAccentColor, size: 11)
+        } else {
+            let text = "Перерывов: \(data.breaksToday)   ·   макс. сидение \(durString(data.longestToday))"
+            drawSmall(text, at: NSPoint(x: x0 + width/2, y: y), align: .center,
+                      color: .secondaryLabelColor, size: 11)
+        }
     }
 
     // MARK: - Текст-хелперы
@@ -171,9 +210,7 @@ final class ChartView: NSView {
         return f.string(from: Date(timeIntervalSince1970: epoch))
     }
 
-    private func oneDp(_ h: Double) -> String {
-        String(format: "%.1f", h)
-    }
+    private func oneDp(_ h: Double) -> String { String(format: "%.1f", h) }
 
     private func durString(_ t: TimeInterval) -> String {
         let m = Int(t) / 60
