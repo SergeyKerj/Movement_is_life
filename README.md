@@ -56,3 +56,7 @@ open Movement_is_life.app
 - `Sources/MovementIsLife/IdleSource.swift` — чтение системного idle
 - `Sources/MovementIsLife/Persistence.swift` — настройки и счётчик в UserDefaults
 - `build.sh` — сборка релиза и упаковка в `.app`
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE).
