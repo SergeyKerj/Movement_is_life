@@ -1,0 +1,10 @@
+# Swift / SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Собранный бандл
+*.app/
+
+# macOS
+.DS_Store
