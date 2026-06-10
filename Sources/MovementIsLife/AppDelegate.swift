@@ -1,19 +1,31 @@
 import AppKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var tracker: SittingTracker!
+    private var history: HistoryStore!
     private var timer: Timer?
     private var blinkTimer: Timer?
 
     private let tickInterval: TimeInterval = 5
 
-    // Пункты меню, которые обновляются на каждом тике.
+    // Пункты меню, обновляемые на каждом тике.
     private let nowItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let todayItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let pauseItem = NSMenuItem(title: "Пауза трекинга", action: #selector(togglePause), keyEquivalent: "p")
+    private let chartView = ChartView()
 
-    // Пресеты для подменю настроек (в минутах).
+    // Учёт сессий сидения за сегодня (для ленты и мотиваторов).
+    private var lastState: SitState = .away
+    private var sessionStart: Date?
+    private var lastTickAt: Date?
+    private var todaySegments: [Seg] = []
+    private var breaksToday = 0
+    private var longestToday: TimeInterval = 0
+    private var lastDayUI = -1
+    private var lastResult: TickResult?
+
+    // Пресеты подменю настроек (минуты).
     private let idlePresets = [1, 2, 3, 5, 7, 10, 15]
     private let limitPresets = [20, 30, 40, 50, 60, 90]
     private let remindPresets = [3, 5, 10, 15]
@@ -21,14 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let settings = Persistence.loadSettings()
         tracker = SittingTracker(settings: settings, tickInterval: tickInterval)
+        history = HistoryStore()
         restoreToday()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "🪑 —"
         buildMenu()
 
-        // Сон / пробуждение → трактуем как отлучку (на тике сработает suspendCutoff,
-        // но явная реакция на сон делает поведение предсказуемым).
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(self, selector: #selector(systemWake),
                        name: NSWorkspace.didWakeNotification, object: nil)
@@ -41,20 +52,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         Persistence.saveToday(total: tracker.todayTotal, day: tracker.currentDay)
+        history.save()
     }
 
     // MARK: - Тик
 
     @objc private func tick() {
-        let r = tracker.tick(now: Date(), idle: IdleSource.seconds())
+        let now = Date()
+        let r = tracker.tick(now: now, idle: IdleSource.seconds())
+        lastResult = r
+
+        bookkeep(r: r, now: now)
         render(r)
+        updateChart(now: now)
+
         Persistence.saveToday(total: tracker.todayTotal, day: tracker.currentDay)
         if r.shouldBlink { blink() }
     }
 
-    @objc private func systemWake() {
-        // Длинный простой во сне закроется suspendCutoff на ближайшем тике; форсируем тик сразу.
-        tick()
+    @objc private func systemWake() { tick() }
+
+    /// Учёт сессий, перерывов и смены дня.
+    private func bookkeep(r: TickResult, now: Date) {
+        let day = tracker.currentDay
+        if day != lastDayUI {
+            todaySegments = []
+            breaksToday = 0
+            longestToday = 0
+            sessionStart = nil
+            lastState = .away
+            lastDayUI = day
+        }
+
+        if lastState == .away && r.state == .sitting {
+            sessionStart = now
+        }
+        if lastState == .sitting && r.state == .away {
+            if let s = sessionStart {
+                let end = lastTickAt ?? now
+                if end.timeIntervalSince(s) > 1 {
+                    todaySegments.append(Seg(start: s.timeIntervalSince1970, end: end.timeIntervalSince1970))
+                }
+            }
+            sessionStart = nil
+            if let ended = r.endedSit, ended >= 60 {   // сидение ≥1 мин = «реальный» перерыв
+                breaksToday += 1
+                longestToday = max(longestToday, ended)
+            }
+        }
+        lastState = r.state
+        lastTickAt = now
+
+        history.update(day: day, sitting: r.todayTotal, detail: currentDetail(r: r, now: now))
+    }
+
+    /// Сегменты с учётом текущего незакрытого сидения.
+    private func liveSegments(now: Date) -> [Seg] {
+        var segs = todaySegments
+        if lastState == .sitting, let s = sessionStart, now.timeIntervalSince(s) > 1 {
+            segs.append(Seg(start: s.timeIntervalSince1970, end: now.timeIntervalSince1970))
+        }
+        return segs
+    }
+
+    private func currentDetail(r: TickResult, now: Date) -> TodayDetail {
+        TodayDetail(day: tracker.currentDay,
+                    segments: liveSegments(now: now),
+                    breaks: breaksToday,
+                    longest: max(longestToday, r.continuousSitting))
     }
 
     // MARK: - Отрисовка
@@ -65,15 +130,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .away:    icon = "🚶"
         case .sitting: icon = r.overLimit ? "⚠️" : "🪑"
         }
-        let label = tracker.paused ? "⏸" : "\(icon) \(short(r.continuousSitting))"
-        statusItem.button?.title = label
+        statusItem.button?.title = tracker.paused ? "⏸" : "\(icon) \(short(r.continuousSitting))"
 
         nowItem.title   = "Сейчас непрерывно: \(long(r.continuousSitting))"
         todayItem.title = "Всего за сегодня: \(long(r.todayTotal))"
         pauseItem.title = tracker.paused ? "Возобновить трекинг" : "Пауза трекинга"
     }
 
-    /// Мигание: несколько быстрых смен заголовка, чтобы зацепить взгляд в строке меню.
+    private func updateChart(now: Date) {
+        guard let r = lastResult else { return }
+        chartView.data = ChartData(
+            segments: liveSegments(now: now),
+            now: now.timeIntervalSince1970,
+            sitLimit: tracker.settings.sitLimit,
+            bars: history.weeklyBars(now: now),
+            breaksToday: breaksToday,
+            longestToday: max(longestToday, r.continuousSitting)
+        )
+    }
+
     private func blink() {
         blinkTimer?.invalidate()
         let normal = statusItem.button?.title ?? "⚠️"
@@ -96,21 +171,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildMenu() {
         let menu = NSMenu()
+        menu.delegate = self
         nowItem.isEnabled = false
         todayItem.isEnabled = false
         menu.addItem(nowItem)
         menu.addItem(todayItem)
         menu.addItem(.separator())
 
+        let chartItem = NSMenuItem()
+        chartItem.view = chartView
+        menu.addItem(chartItem)
+        menu.addItem(.separator())
+
         menu.addItem(submenu(title: "Порог отлучки", presets: idlePresets,
-                             current: Int(tracker.settings.idleThreshold / 60),
-                             action: #selector(setIdle(_:))))
+                             current: Int(tracker.settings.idleThreshold / 60), action: #selector(setIdle(_:))))
         menu.addItem(submenu(title: "Порог «встать»", presets: limitPresets,
-                             current: Int(tracker.settings.sitLimit / 60),
-                             action: #selector(setLimit(_:))))
+                             current: Int(tracker.settings.sitLimit / 60), action: #selector(setLimit(_:))))
         menu.addItem(submenu(title: "Промигивать каждые", presets: remindPresets,
-                             current: Int(tracker.settings.remindInterval / 60),
-                             action: #selector(setRemind(_:))))
+                             current: Int(tracker.settings.remindInterval / 60), action: #selector(setRemind(_:))))
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Сбросить счётчики", action: #selector(resetCounters), keyEquivalent: "r")
@@ -120,6 +198,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         for item in menu.items where item.action != nil { item.target = self }
         statusItem.menu = menu
+    }
+
+    /// Перед раскрытием — освежить график (растёт текущая сессия).
+    func menuWillOpen(_ menu: NSMenu) {
+        updateChart(now: Date())
     }
 
     private func submenu(title: String, presets: [Int], current: Int, action: Selector) -> NSMenuItem {
@@ -136,8 +219,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return parent
     }
 
-    private func refreshChecks(in menuItem: NSMenuItem?, current: Int) {
-        guard let sub = menuItem?.submenu else { return }
+    private func refreshChecks(for menu: NSMenu?, current: Int) {
+        guard let sub = menu else { return }
         for item in sub.items { item.state = (item.tag == current) ? .on : .off }
     }
 
@@ -145,24 +228,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func setIdle(_ sender: NSMenuItem) {
         tracker.settings.idleThreshold = TimeInterval(sender.tag * 60)
-        persistSettings()
-        refreshChecks(in: sender.menu?.supermenu?.items.first { $0.submenu == sender.menu }, current: sender.tag)
+        Persistence.saveSettings(tracker.settings)
+        refreshChecks(for: sender.menu, current: sender.tag)
     }
 
     @objc private func setLimit(_ sender: NSMenuItem) {
         tracker.settings.sitLimit = TimeInterval(sender.tag * 60)
-        persistSettings()
-        refreshChecks(in: sender.menu?.supermenu?.items.first { $0.submenu == sender.menu }, current: sender.tag)
+        Persistence.saveSettings(tracker.settings)
+        refreshChecks(for: sender.menu, current: sender.tag)
     }
 
     @objc private func setRemind(_ sender: NSMenuItem) {
         tracker.settings.remindInterval = TimeInterval(sender.tag * 60)
-        persistSettings()
-        refreshChecks(in: sender.menu?.supermenu?.items.first { $0.submenu == sender.menu }, current: sender.tag)
+        Persistence.saveSettings(tracker.settings)
+        refreshChecks(for: sender.menu, current: sender.tag)
     }
 
     @objc private func resetCounters() {
         tracker.resetCounters()
+        todaySegments = []
+        breaksToday = 0
+        longestToday = 0
+        sessionStart = nil
         tick()
     }
 
@@ -171,20 +258,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tick()
     }
 
-    @objc private func quit() {
-        NSApp.terminate(nil)
-    }
+    @objc private func quit() { NSApp.terminate(nil) }
 
-    // MARK: - Персист
-
-    private func persistSettings() {
-        Persistence.saveSettings(tracker.settings)
-    }
+    // MARK: - Восстановление
 
     private func restoreToday() {
-        let (total, day) = Persistence.loadToday()
         let today = Calendar.current.ordinality(of: .day, in: .era, for: Date()) ?? 0
+        let (total, day) = Persistence.loadToday()
         if day == today { tracker.restoreToday(total, day: day) }
+        if let d = history.restoredToday(for: today) {
+            todaySegments = d.segments
+            breaksToday = d.breaks
+            longestToday = d.longest
+        }
+        lastDayUI = today
     }
 
     // MARK: - Формат времени

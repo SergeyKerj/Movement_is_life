@@ -25,7 +25,8 @@ struct TickResult {
     var continuousSitting: TimeInterval
     var todayTotal: TimeInterval
     var overLimit: Bool
-    var shouldBlink: Bool   // пора промигнуть иконкой прямо сейчас
+    var shouldBlink: Bool          // пора промигнуть иконкой прямо сейчас
+    var endedSit: TimeInterval?    // если на этом тике закончилось сидение — его длина (для истории)
 }
 
 /// Машина состояний. Не знает ни про таймеры, ни про UI —
@@ -74,14 +75,16 @@ final class SittingTracker {
 
         if suspended || !activeNow {
             // ОТОШЁЛ. Ретро-коррекция: idle-период ошибочно копился как сидение — вычесть.
+            var endedSit: TimeInterval? = nil
             if state == .sitting && !suspended {
+                endedSit = continuousSitting
                 todayTotal = max(0, todayTotal - idle)
             }
             state = .away
             continuousSitting = 0
             overLimit = false
             lastBlink = nil
-            return result(shouldBlink: false)
+            return result(shouldBlink: false, endedSit: endedSit)
         }
 
         // СИЖУ.
@@ -118,13 +121,14 @@ final class SittingTracker {
 
     var currentDay: Int { lastDay ?? 0 }
 
-    private func result(shouldBlink: Bool) -> TickResult {
+    private func result(shouldBlink: Bool, endedSit: TimeInterval? = nil) -> TickResult {
         TickResult(
             state: state,
             continuousSitting: continuousSitting,
             todayTotal: todayTotal,
             overLimit: overLimit,
-            shouldBlink: shouldBlink
+            shouldBlink: shouldBlink,
+            endedSit: endedSit
         )
     }
 }
