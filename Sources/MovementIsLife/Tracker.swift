@@ -19,13 +19,19 @@ enum SitState {
     case away
 }
 
+/// Зачем промигнуть иконкой.
+enum BlinkKind {
+    case standUp      // просидел больше лимита — пора встать
+    case stayActive   // вот-вот сброс по отлучке: «ещё тут? шевельни мышь»
+}
+
 /// Результат одного тика — что должен сделать UI.
 struct TickResult {
     var state: SitState
     var continuousSitting: TimeInterval
     var todayTotal: TimeInterval
     var overLimit: Bool
-    var shouldBlink: Bool          // пора промигнуть иконкой прямо сейчас
+    var blink: BlinkKind?          // если не nil — промигнуть иконкой (и с какой причиной)
     var endedSit: TimeInterval?    // если на этом тике закончилось сидение — его длина (для истории)
 }
 
@@ -44,6 +50,12 @@ final class SittingTracker {
     private var lastTick: Date?
     private var lastDay: Int?
 
+    // Предупреждение присутствия: за сколько секунд до порога отлучки промигнуть.
+    private let presenceWarnings: [Int] = [60, 30]
+    private let presenceFloor: TimeInterval = 60  // не дёргать, если сидим меньше минуты
+    private var warned: Set<Int> = []
+    private var lastIdle: TimeInterval = 0
+
     /// Аномально большой интервал между тиками = сон/заморозка системы → трактуем как отлучку.
     private let suspendCutoff: TimeInterval
 
@@ -54,7 +66,7 @@ final class SittingTracker {
 
     /// Главный шаг. `now` и `idle` приходят снаружи (idle — секунды без ввода от системы).
     func tick(now: Date, idle: TimeInterval, calendar: Calendar = .current) -> TickResult {
-        defer { lastTick = now }
+        defer { lastTick = now; lastIdle = idle }
 
         // Сброс «за сегодня» при смене календарного дня.
         let day = calendar.ordinality(of: .day, in: .era, for: now) ?? 0
@@ -66,7 +78,8 @@ final class SittingTracker {
             continuousSitting = 0
             overLimit = false
             lastBlink = nil
-            return result(shouldBlink: false)
+            warned.removeAll()
+            return result(blink: nil)
         }
 
         let elapsed = lastTick.map { now.timeIntervalSince($0) } ?? 0
@@ -84,7 +97,8 @@ final class SittingTracker {
             continuousSitting = 0
             overLimit = false
             lastBlink = nil
-            return result(shouldBlink: false, endedSit: endedSit)
+            warned.removeAll()
+            return result(blink: nil, endedSit: endedSit)
         }
 
         // СИЖУ.
@@ -92,18 +106,35 @@ final class SittingTracker {
         continuousSitting += elapsed
         todayTotal += elapsed
 
-        var blink = false
+        // Свежий ввод (idle упал) — начинаем новый цикл предупреждений присутствия.
+        if idle < lastIdle { warned.removeAll() }
+
+        var blink: BlinkKind? = nil
+
+        // Предупреждение присутствия: idle подбирается к порогу отлучки, а мы ещё «сидим».
+        // Каждое окно (60/30 с до порога) срабатывает один раз за цикл бездействия.
+        if continuousSitting >= presenceFloor {
+            for w in presenceWarnings {
+                let trigger = settings.idleThreshold - TimeInterval(w)
+                if trigger > 0, idle >= trigger, !warned.contains(w) {
+                    warned.insert(w)
+                    blink = .stayActive
+                }
+            }
+        }
+
+        // Лимит «пора встать» — важнее, перебивает предупреждение присутствия.
         if continuousSitting >= settings.sitLimit {
             if !overLimit {
                 overLimit = true
                 lastBlink = now
-                blink = true
+                blink = .standUp
             } else if let lb = lastBlink, now.timeIntervalSince(lb) >= settings.remindInterval {
                 lastBlink = now
-                blink = true
+                blink = .standUp
             }
         }
-        return result(shouldBlink: blink)
+        return result(blink: blink)
     }
 
     func resetCounters() {
@@ -121,13 +152,13 @@ final class SittingTracker {
 
     var currentDay: Int { lastDay ?? 0 }
 
-    private func result(shouldBlink: Bool, endedSit: TimeInterval? = nil) -> TickResult {
+    private func result(blink: BlinkKind?, endedSit: TimeInterval? = nil) -> TickResult {
         TickResult(
             state: state,
             continuousSitting: continuousSitting,
             todayTotal: todayTotal,
             overLimit: overLimit,
-            shouldBlink: shouldBlink,
+            blink: blink,
             endedSit: endedSit
         )
     }

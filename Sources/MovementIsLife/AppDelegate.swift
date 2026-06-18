@@ -67,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateChart(now: now)
 
         Persistence.saveToday(total: tracker.todayTotal, day: tracker.currentDay)
-        if r.shouldBlink { blink() }
+        if let kind = r.blink { blink(kind: kind) }
     }
 
     @objc private func systemWake() { tick() }
@@ -149,10 +149,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
     }
 
-    private func blink() {
+    private func blink(kind: BlinkKind) {
         blinkTimer?.invalidate()
         let normal = statusItem.button?.title ?? "⚠️"
-        let flash = "‼️ ВСТАНЬ"
+        let flash: String
+        switch kind {
+        case .standUp:    flash = "‼️ ВСТАНЬ"
+        case .stayActive: flash = "🖱 ещё тут?"
+        }
         var count = 0
         let bt = Timer(timeInterval: 0.4, repeats: true) { [weak self] t in
             guard let self else { t.invalidate(); return }
