@@ -56,6 +56,12 @@ final class SittingTracker {
     private var warned: Set<Int> = []
     private var lastIdle: TimeInterval = 0
 
+    // Память о последнем сбросе по отлучке — для кнопки «Вернуть таймер».
+    private let undoWindow: TimeInterval = 2 * 3600   // отменять можно в течение 2 часов
+    private var resetSaved: TimeInterval = 0          // сколько было непрерывно сидения на момент сброса
+    private var resetAt: Date?                        // когда случился сброс
+    private var resetSubtracted: TimeInterval = 0     // что вычли из «за сегодня» при сбросе
+
     /// Аномально большой интервал между тиками = сон/заморозка системы → трактуем как отлучку.
     private let suspendCutoff: TimeInterval
 
@@ -92,6 +98,10 @@ final class SittingTracker {
             if state == .sitting && !suspended {
                 endedSit = continuousSitting
                 todayTotal = max(0, todayTotal - idle)
+                // Запоминаем сброс — вдруг ты на самом деле сидел (Zoom) и захочешь вернуть.
+                resetSaved = continuousSitting
+                resetAt = now
+                resetSubtracted = idle
             }
             state = .away
             continuousSitting = 0
@@ -142,6 +152,34 @@ final class SittingTracker {
         todayTotal = 0
         overLimit = false
         lastBlink = nil
+        resetAt = nil
+    }
+
+    /// Доступна ли отмена последнего сброса (в пределах окна).
+    func undoAvailable(now: Date) -> Bool {
+        guard let at = resetAt else { return false }
+        return now.timeIntervalSince(at) <= undoWindow
+    }
+
+    /// Сколько было непрерывного сидения на момент сброса (для подписи кнопки).
+    var undoSavedValue: TimeInterval { resetSaved }
+
+    /// Отменить сброс: вернуть таймер так, будто всё это время ты сидел.
+    /// Возвращает восстановленное значение непрерывного сидения, или nil если отмена недоступна.
+    @discardableResult
+    func undoReset(now: Date) -> TimeInterval? {
+        guard let at = resetAt, now.timeIntervalSince(at) <= undoWindow else { return nil }
+        let gap = max(0, now.timeIntervalSince(at))
+        let restored = resetSaved + gap
+        // Возвращаем «за сегодня»: вычтенное при сбросе + не учтённую часть простоя.
+        todayTotal += resetSubtracted + max(0, gap - continuousSitting)
+        continuousSitting = restored
+        state = .sitting
+        overLimit = restored >= settings.sitLimit
+        lastBlink = overLimit ? now : nil   // если уже за лимитом — напомним «встать» через интервал
+        warned.removeAll()
+        resetAt = nil
+        return restored
     }
 
     /// Восстановление «за сегодня» после перезапуска в тот же день.

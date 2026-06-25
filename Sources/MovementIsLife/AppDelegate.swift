@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let nowItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let todayItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let pauseItem = NSMenuItem(title: "Пауза трекинга", action: #selector(togglePause), keyEquivalent: "p")
+    private let undoItem = NSMenuItem(title: "↩︎ Вернуть таймер", action: #selector(undoReset), keyEquivalent: "z")
     private let chartView = ChartView()
 
     // Учёт сессий сидения за сегодня (для ленты и мотиваторов).
@@ -135,6 +136,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         nowItem.title   = "Сейчас непрерывно: \(long(r.continuousSitting))"
         todayItem.title = "Всего за сегодня: \(long(r.todayTotal))"
         pauseItem.title = tracker.paused ? "Возобновить трекинг" : "Пауза трекинга"
+        refreshUndoItem()
+    }
+
+    /// Кнопка «Вернуть таймер» видна только пока отмена сброса доступна (окно 2 ч).
+    private func refreshUndoItem() {
+        let avail = tracker.undoAvailable(now: Date())
+        undoItem.isHidden = !avail
+        if avail {
+            undoItem.title = "↩︎ Вернуть таймер (был \(long(tracker.undoSavedValue)))"
+        }
     }
 
     private func updateChart(now: Date) {
@@ -180,6 +191,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         todayItem.isEnabled = false
         menu.addItem(nowItem)
         menu.addItem(todayItem)
+        undoItem.isHidden = true
+        menu.addItem(undoItem)
         menu.addItem(.separator())
 
         let chartItem = NSMenuItem()
@@ -207,6 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Перед раскрытием — освежить график (растёт текущая сессия).
     func menuWillOpen(_ menu: NSMenu) {
         updateChart(now: Date())
+        refreshUndoItem()
     }
 
     private func submenu(title: String, presets: [Int], current: Int, action: Selector) -> NSMenuItem {
@@ -254,6 +268,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         breaksToday = 0
         longestToday = 0
         sessionStart = nil
+        tick()
+    }
+
+    @objc private func undoReset() {
+        let now = Date()
+        guard let restored = tracker.undoReset(now: now) else { return }
+        // Склеиваем разрыв: всё, что попало в восстановленное окно, становится одним сидением.
+        let mergeStart = now.addingTimeInterval(-restored).timeIntervalSince1970
+        let dropped = todaySegments.filter { $0.start >= mergeStart - 1 }.count
+        todaySegments.removeAll { $0.start >= mergeStart - 1 }
+        breaksToday = max(0, breaksToday - dropped)
+        longestToday = max(longestToday, restored)
+        sessionStart = Date(timeIntervalSince1970: mergeStart)
+        lastState = .sitting
         tick()
     }
 
